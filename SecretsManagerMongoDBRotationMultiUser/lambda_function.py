@@ -11,8 +11,6 @@ from pymongo import MongoClient, errors
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-MAX_RDS_DB_INSTANCE_ARN_LENGTH = 256
-
 
 def lambda_handler(event, context):
     """Secrets Manager MongoDB Handler
@@ -155,10 +153,10 @@ def set_secret(service_client, arn, token):
     # First try to login with the pending secret, if it succeeds, return
     current_dict = get_secret_dict(service_client, arn, "AWSCURRENT")
     pending_dict = get_secret_dict(service_client, arn, "AWSPENDING", token)
-    client, conn = get_connection(pending_dict)
-    if conn is not None:
+    conn = get_connection(pending_dict)
+    if conn:
+        conn.logout()
         logger.info("setSecret: AWSPENDING secret is already set as password in MongoDB for secret arn %s." % arn)
-        client.close()
         return
 
     # Make sure the user from current and pending match
@@ -173,23 +171,22 @@ def set_secret(service_client, arn, token):
 
     # Before we do anything with the secret, make sure the AWSCURRENT secret is valid by logging in to the db
     # This ensures that the credential we are rotating is valid to protect against a confused deputy attack
-    current_client, conn = get_connection(current_dict)
-    if conn is None:
+    conn = get_connection(current_dict)
+    if not conn:
         logger.error("setSecret: Unable to log into database using current credentials for secret %s" % arn)
         raise ValueError("Unable to log into database using current credentials for secret %s" % arn)
-    # Close the current client as we don't need it anymore
-    current_client.close()
+    conn.logout()
 
-    # Now get the master arn from the current secret to fetch master secret contents
+    # Now get the master arn from the current secret
     master_arn = current_dict['masterarn']
-    master_dict = get_secret_dict(service_client, master_arn, "AWSCURRENT", None, True)
+    master_dict = get_secret_dict(service_client, master_arn, "AWSCURRENT")
     if current_dict['host'] != master_dict['host']:
         logger.error("setSecret: Current database host %s is not the same host as master %s" % (current_dict['host'], master_dict['host']))
         raise ValueError("Current database host %s is not the same host as master %s" % (current_dict['host'], master_dict['host']))
 
     # Now log into the database with the master credentials
-    master_client, conn = get_connection(master_dict)
-    if conn is None:
+    conn = get_connection(master_dict)
+    if not conn:
         logger.error("setSecret: Unable to log into database using credentials in master secret %s" % master_arn)
         raise ValueError("Unable to log into database using credentials in master secret %s" % master_arn)
 
@@ -206,9 +203,7 @@ def set_secret(service_client, arn, token):
         logger.error("setSecret: Error encountered when attempting to set password in database for user %s", pending_dict['username'])
         raise ValueError("Error encountered when attempting to set password in database for user %s", pending_dict['username'])
     finally:
-        # Always close the master client
-        if master_client is not None:
-            master_client.close()
+        conn.logout()
 
 
 def test_secret(service_client, arn, token):
@@ -234,22 +229,20 @@ def test_secret(service_client, arn, token):
     """
     # Try to login with the pending secret, if it succeeds, return
     pending_dict = get_secret_dict(service_client, arn, "AWSPENDING", token)
-    client, conn = get_connection(pending_dict)
-    try:
-        if conn is not None:
-            # This is where the lambda will validate the user's permissions. Modify the below lines to
-            # tailor these validations to your needs
+    conn = get_connection(pending_dict)
+    if conn:
+        # This is where the lambda will validate the user's permissions. Modify the below lines to
+        # tailor these validations to your needs
+        try:
             conn.command('usersInfo', pending_dict['username'])
+        finally:
+            conn.logout()
 
-            logger.info("testSecret: Successfully signed into MongoDB with AWSPENDING secret in %s." % arn)
-            return
-        else:
-            logger.error("testSecret: Unable to log into database with pending secret of secret ARN %s" % arn)
-            raise ValueError("Unable to log into database with pending secret of secret ARN %s" % arn)
-    finally:
-        # Always close the client
-        if client is not None:
-            client.close()
+        logger.info("testSecret: Successfully signed into MongoDB with AWSPENDING secret in %s." % arn)
+        return
+    else:
+        logger.error("testSecret: Unable to log into database with pending secret of secret ARN %s" % arn)
+        raise ValueError("Unable to log into database with pending secret of secret ARN %s" % arn)
 
 
 def finish_secret(service_client, arn, token):
@@ -296,7 +289,7 @@ def get_connection(secret_dict):
         secret_dict (dict): The Secret Dictionary
 
     Returns:
-        Tuple: (client, db) - The pymongo.MongoClient and pymongo.database.Database objects if successful. (None, None) otherwise
+        Connection: The pymongo.database.Database object if successful. None otherwise
 
     Raises:
         KeyError: If the secret json does not contain the expected keys
@@ -310,13 +303,10 @@ def get_connection(secret_dict):
     use_ssl, fall_back = get_ssl_config(secret_dict)
 
     # if an 'ssl' key is not found or does not contain a valid value, attempt an SSL connection and fall back to non-SSL on failure
-    client, conn = connect_and_authenticate(secret_dict, port, dbname, use_ssl)
-    if conn is not None or not fall_back:
-        return client, conn
+    conn = connect_and_authenticate(secret_dict, port, dbname, use_ssl)
+    if conn or not fall_back:
+        return conn
     else:
-        # Close the first client if connection failed but client was created
-        if client is not None:
-            client.close()
         return connect_and_authenticate(secret_dict, port, dbname, False)
 
 
@@ -366,7 +356,7 @@ def connect_and_authenticate(secret_dict, port, dbname, use_ssl):
     """Attempt to connect and authenticate to a MongoDB instance
 
     This helper function tries to connect to the database using connectivity info passed in.
-    If successful, it returns the client and database objects, else None, None
+    If successful, it returns the connection, else None
 
     Args:
         - secret_dict (dict): The Secret Dictionary
@@ -375,7 +365,7 @@ def connect_and_authenticate(secret_dict, port, dbname, use_ssl):
         - use_ssl (bool): Flag indicating whether connection should use SSL/TLS
 
     Returns:
-        Tuple: (client, db) - The pymongo.MongoClient and pymongo.database.Database objects if successful. (None, None) otherwise
+        Connection: The pymongo.database.Database object if successful. None otherwise
 
     Raises:
         KeyError: If the secret json does not contain the expected keys
@@ -384,20 +374,20 @@ def connect_and_authenticate(secret_dict, port, dbname, use_ssl):
     # Try to obtain a connection to the db
     try:
         # Hostname verfification and server certificate validation enabled by default when ssl=True
-        client = MongoClient(host=secret_dict['host'], port=port, username=secret_dict['username'], password=secret_dict['password'], authSource=dbname, connectTimeoutMS=5000, serverSelectionTimeoutMS=5000, tls=use_ssl)
+        client = MongoClient(host=secret_dict['host'], port=port, connectTimeoutMS=5000, serverSelectionTimeoutMS=5000, ssl=use_ssl)
         db = client[dbname]
-        db.command('ping')
+        db.authenticate(secret_dict['username'], secret_dict['password'])
         logger.info("Successfully established %s connection as user '%s' with host: '%s'" % ("SSL/TLS" if use_ssl else "non SSL/TLS", secret_dict['username'], secret_dict['host']))
-        return client, db
+        return db
     except errors.PyMongoError as e:
         if 'SSL handshake failed' in e.args[0]:
             logger.error("Unable to establish SSL/TLS handshake, check that SSL/TLS is enabled on the host: %s" % secret_dict['host'])
         elif re.search("hostname '.+' doesn't match", e.args[0]):
             logger.error("Hostname verification failed when estlablishing SSL/TLS Handshake with host: %s" % secret_dict['host'])
-        return None, None
+        return None
 
 
-def get_secret_dict(service_client, arn, stage, token=None, master_secret=False):
+def get_secret_dict(service_client, arn, stage, token=None):
     """Gets the secret dictionary corresponding for the secret arn, stage, and token
 
     This helper function gets credentials for the arn and stage passed in and returns the dictionary by parsing the JSON string
@@ -407,11 +397,9 @@ def get_secret_dict(service_client, arn, stage, token=None, master_secret=False)
 
         arn (string): The secret ARN or other identifier
 
-        stage (string): The stage identifying the secret version
-
         token (string): The ClientRequestToken associated with the secret version, or None if no validation is desired
 
-        master_secret (boolean): A flag that indicates if we are getting a master secret.
+        stage (string): The stage identifying the secret version
 
     Returns:
         SecretDictionary: Secret dictionary
@@ -422,7 +410,7 @@ def get_secret_dict(service_client, arn, stage, token=None, master_secret=False)
         ValueError: If the secret is not valid JSON
 
     """
-    required_fields = ['host', 'username', 'password', 'engine']
+    required_fields = ['host', 'username', 'password']
 
     # Only do VersionId validation against the stage if a token is passed in
     if token:
@@ -433,23 +421,11 @@ def get_secret_dict(service_client, arn, stage, token=None, master_secret=False)
     secret_dict = json.loads(plaintext)
 
     # Run validations against the secret
-    if master_secret and (set(secret_dict.keys()) == set(['username', 'password'])):
-        # If this is an DocumentDB-made Master Secret, we can fetch `host` and other connection params
-        # from the DescribeDBClusters DocDB API using the DB Cluster ARN as a filter.
-        # The DB Cluster ARN is fetched from the DocumentDB-made Master Secret's AWS generated tags.
-        db_cluster_arn = fetch_cluster_arn_from_tags(service_client, arn)
-        if db_cluster_arn:
-            secret_dict = get_connection_params_from_docdb_api(secret_dict, db_cluster_arn)
-            logger.info("setSecret: Successfully fetched connection params for Master Secret %s from DescribeDBClusters API." % arn)
-
-        # For non-DocumentDB-made Master Secrets that are missing either `host` or `engine`, this will error below when checking for required connection params.
-
+    if 'engine' not in secret_dict or secret_dict['engine'] != 'mongo':
+        raise KeyError("Database engine must be set to 'mongo' in order to use this rotation lambda")
     for field in required_fields:
         if field not in secret_dict:
             raise KeyError("%s key is missing from secret JSON" % field)
-
-    if secret_dict['engine'] != 'mongo':
-        raise KeyError("Database engine must be set to 'mongo' in order to use this rotation lambda")
 
     # Parse and return the secret JSON string
     return secret_dict
@@ -475,101 +451,6 @@ def get_alt_username(current_username):
         return current_username[:(len(clone_suffix) * -1)]
     else:
         return current_username + clone_suffix
-
-
-def fetch_cluster_arn_from_tags(service_client, secret_arn):
-    """Fetches DB Cluster ARN from the given secret's metadata.
-
-    Fetches DB Cluster ARN from the given secret's metadata.
-
-    Args:
-        service_client (client): The secrets manager service client
-
-        secret_arn (String): The secret ARN used in a DescribeSecrets API call to fetch the secret's metadata.
-
-    Returns:
-        db_cluster_arn (string): The DB Cluster ARN of the Primary DocumentDB cluster
-
-    """
-    metadata = service_client.describe_secret(SecretId=secret_arn)
-
-    if 'Tags' not in metadata:
-        logger.warning("setSecret: The secret %s is not a service-linked secret, so it does not have the aws:rds:primaryDBClusterArn AWS generated tag" % secret_arn)
-        return None
-
-    tags = metadata['Tags']
-
-    # Check if DB Cluster ARN is present in secret Tags
-    db_cluster_arn = None
-    for tag in tags:
-        if tag['Key'].lower() == 'aws:rds:primarydbclusterarn':
-            db_cluster_arn = tag['Value']
-
-    # DB Cluster ARN must be present in secret AWS generated tags to use this work-around
-    if not db_cluster_arn:
-        logger.warning("setSecret: DB Cluster ARN not present in AWS generated tags for secret %s" % secret_arn)
-    elif len(db_cluster_arn) > MAX_RDS_DB_INSTANCE_ARN_LENGTH:
-        logger.error("setSecret: %s is not a valid DB Cluster ARN. It exceeds the maximum length of %d." % (db_cluster_arn, MAX_RDS_DB_INSTANCE_ARN_LENGTH))
-        raise ValueError("%s is not a valid DB Cluster ARN. It exceeds the maximum length of %d." % (db_cluster_arn, MAX_RDS_DB_INSTANCE_ARN_LENGTH))
-
-    return db_cluster_arn
-
-
-def get_connection_params_from_docdb_api(master_dict, master_cluster_arn):
-    """Fetches connection parameters (`host`, `port`, etc.) from the DescribeDBClusters DocumentDB API using `master_instance_arn` in the master secret metadata as a filter.
-
-    This helper function fetches connection parameters from the DescribeDBClusters DocumentDB API using `master_cluster_arn` in the master secret metadata as a filter.
-
-    Args:
-        master_dict (dictionary): The master secret dictionary that will be updated with connection parameters.
-
-        master_cluster_arn (string): The DB cluster ARN from master secret AWS generated tag that will be used as a filter in DescribeDBClusters DocumentDB API calls.
-
-    Returns:
-        master_dict (dictionary): An updated master secret dictionary that now contains connection parameters such as `host`, `port`, etc.
-
-    """
-    # put connection parameters in master secret dictionary
-    cluster_info = get_cluster_info_from_docdb_api(master_cluster_arn)
-    master_dict['host'] = cluster_info['Endpoint']
-    master_dict['port'] = cluster_info['Port']
-    master_dict['engine'] = 'mongo'
-
-    return master_dict
-
-
-def get_cluster_info_from_docdb_api(cluster_id):
-    """Fetches RDS cluster infomation from the DescribeDBClusters DocumentDB API using DBClusterIdentifier as a filter.
-
-    This helper function fetches RDS cluster infomation from the DescribeDBClusters DocumentDB API using DBClusterIdentifier as a filter.
-
-    Agrs:
-        cluster_id (string): The DBClusterIdentifier of the RDS cluster to describe
-
-    Returns:
-        dbClusterResponse (dict): The DescribeDBClusters DocumentDB API response if found, otherwise None
-
-    Rasies:
-        Exception: If the DescribeDBClusters DocumentDB API returns an error
-
-    """
-    # Setup the client
-    docdb_client = boto3.client('docdb')
-
-    # Call DescribeDBClusters RDS API
-    try:
-        describe_response = docdb_client.describe_db_clusters(DBClusterIdentifier=cluster_id)
-    except Exception as err:
-        logger.error("setSecret: Encountered API error while fetching connection parameters from DescribeDBClusters DocumentDB API: %s" % err)
-        raise Exception("Encountered API error while fetching connection parameters from DescribeDBClusters DocumentDB API: %s" % err)
-    # Verify the instance was found
-    clusters = describe_response['DBClusters']
-    if not clusters:
-        logger.error("setSecret: %s is not a valid DB Cluster ARN. No Clusters found when using DescribeDBClusters DocumentDB API to get connection params." % cluster_id)
-        raise ValueError("%s is not a valid DB Cluster ARN. No Clusters found when using DescribeDBClusters DocumentDB API to get connection params." % cluster_id)
-
-    # DB cluster identifiers are unique - can only be one result
-    return clusters[0]
 
 
 def get_environment_bool(variable_name, default_value):
